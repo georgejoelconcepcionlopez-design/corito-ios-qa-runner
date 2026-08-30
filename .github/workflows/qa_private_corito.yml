@@ -1,0 +1,286 @@
+name: QA Private Corito
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qa-private-corito
+  cancel-in-progress: false
+
+jobs:
+  qa:
+    name: Corito Final Device QA (iPhone + iPad, private source)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Read-only SSH deploy key committed nowhere: key material comes from a
+      # GitHub Actions secret only. Keyfile is deleted immediately after clone.
+      - name: Clone private repo at fixed commit (read-only deploy key)
+        env:
+          CORITO_PRIVATE_REPO_SSH_KEY: ${{ secrets.CORITO_PRIVATE_REPO_SSH_KEY }}
+          PRIVATE_SHA: 1ce8891daca55dbd2976186aa14ea474b746191a
+        run: |
+          echo "Setting up ephemeral SSH deploy key..."
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$CORITO_PRIVATE_REPO_SSH_KEY" > "$HOME/.ssh/corito_qa_ed25519"
+          chmod 600 "$HOME/.ssh/corito_qa_ed25519"
+          eval "$(ssh-agent -s)" >/dev/null
+          ssh-add "$HOME/.ssh/corito_qa_ed25519" >/dev/null
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/corito-private"
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=15" \
+            git init -q "$RUNNER_TEMP/corito-private"
+          git -C "$RUNNER_TEMP/corito-private" remote add origin git@github.com:georgejoelconcepcionlopez-design/corito-domino-flutter.git
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=15" \
+            git -C "$RUNNER_TEMP/corito-private" fetch --depth 1 origin "$PRIVATE_SHA"
+          git -C "$RUNNER_TEMP/corito-private" checkout -q --detach FETCH_HEAD
+          OUR_SHA=$(git -C "$RUNNER_TEMP/corito-private" rev-parse HEAD)
+          echo "PRIVATE_HEAD_SHA=$OUR_SHA"
+          git -C "$RUNNER_TEMP/corito-private" log -1 --oneline
+          if [ "$OUR_SHA" != "$PRIVATE_SHA" ]; then echo "PRIVATE_SHA_MISMATCH"; exit 1; fi
+          echo "PRIVATE_CLONE_OK"
+          # Wipe the keyfile and kill the agent as soon as the clone is done.
+          rm -f "$HOME/.ssh/corito_qa_ed25519" "$HOME/.ssh/corito_qa_ed25519.pub"
+          ssh-agent -k >/dev/null 2>&1 || true
+
+      - name: Flutter pub get (private checkout)
+        run: |
+          cd "$RUNNER_TEMP/corito-private"
+          mkdir -p build/ios/SourcePackages
+          flutter pub get
+
+      - name: Migrate to pure Swift Package Manager (remove CocoaPods)
+        run: |
+          cd "$RUNNER_TEMP/corito-private/ios"
+          pod deintegrate || true
+          rm -f Podfile Podfile.lock
+          cd "$RUNNER_TEMP/corito-private"
+
+      - name: Find simulator UDIDs
+        run: |
+          find_device() {
+            local kind="$1"; shift
+            for name in "$@"; do
+              local udid
+              udid=$(xcrun simctl list devices available -j | ruby -rjson -e "d=JSON.parse(STDIN.read)['devices']; d.each{|rt,ds| ds.each{|x| if x['isAvailable'] && x['name']=='$name' then print x['udid']; exit end } }")
+              if [ -n "$udid" ]; then echo "$udid"; return 0; fi
+            done
+            xcrun simctl list devices available -j | ruby -rjson -e "d=JSON.parse(STDIN.read)['devices']; d.each{|rt,ds| ds.each{|x| if x['isAvailable'] && x['name'].include?('$kind') then print x['udid']; exit end } }"
+          }
+          IPHONE=$(find_device iPhone "iPhone 17 Pro Max" "iPhone 16 Pro Max" "iPhone 15 Pro Max")
+          IPAD=$(find_device iPad "iPad Pro 13-inch (M4)" "iPad Pro 13-inch" "iPad Pro 12.9-inch (6th generation)")
+          echo "iPhone UDID: $IPHONE"
+          echo "iPad UDID:   $IPAD"
+          if [ -z "$IPHONE" ]; then echo "NO_IPHONE_SIM_FOUND"; exit 1; fi
+          if [ -z "$IPAD" ]; then echo "NO_IPAD_SIM_FOUND"; exit 1; fi
+          echo "IPHONE_UDID=$IPHONE" >> "$GITHUB_ENV"
+          echo "IPAD_UDID=$IPAD" >> "$GITHUB_ENV"
+          echo "UDIDS_OK"
+
+      - name: Boot simulators
+        run: |
+          echo "Booting $IPHONE_UDID"
+          xcrun simctl boot "$IPHONE_UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$IPHONE_UDID" -b
+          echo "iPhone booted"
+          echo "Booting $IPAD_UDID"
+          xcrun simctl boot "$IPAD_UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$IPAD_UDID" -b
+          echo "BOTH_BOOTED"
+          xcrun simctl list devices booted
+
+      - name: Build real app (simulator, debug) once
+        run: |
+          cd "$RUNNER_TEMP/corito-private"
+          flutter build ios --simulator
+          cp -R build/ios/iphonesimulator/Runner.app /tmp/RunnerReal.app
+          echo "REAL_APP_BUILT"
+
+      - name: Offline surface audit (app has no remote dependencies)
+        run: |
+          cd "$RUNNER_TEMP/corito-private"
+          grep -rnE "package:http|package:dio|package:web_socket_channel|HttpClient|Socket\(" lib pubspec.yaml ios 2>/dev/null || echo "NO_REMOTE_DEPENDENCIES_FOUND"
+          echo "OFFLINE_AUDIT_DONE"
+
+      # ========================= iPhone =========================
+      - name: QA drive - iPhone
+        id: qa-iphone
+        timeout-minutes: 25
+        run: |
+          cd "$RUNNER_TEMP/corito-private"
+          set +e
+          flutter drive --driver=test_driver/integration_test.dart --target=integration_test/qa_test.dart --dart-define=QA_DEVICE=iphone -d "$IPHONE_UDID" 2>&1 | tee /tmp/drive_iphone.log
+          RC=${PIPESTATUS[0]}
+          grep -E '^QA_|^SEVERE|^Error' /tmp/drive_iphone.log | head -80 || true
+          if [ "$RC" -ne 0 ]; then
+            echo "DRIVE_RC_IPHONE=$RC"
+            echo "--- booted devices ---"
+            xcrun simctl list devices booted || true
+            echo "--- runner processes ---"
+            ps aux | grep -F "Runner.app" | grep -v grep || echo "NO_RUNNER_PROC"
+            echo "--- last 30 lines of drive log ---"
+            tail -30 /tmp/drive_iphone.log || true
+            echo "--- simulator log tail for bundle ---"
+            xcrun simctl spawn "$IPHONE_UDID" log show --last 5m --style compact --predicate "processImagePath CONTAINS 'Runner'" 2>/dev/null | tail -40 || true
+          fi
+          exit "$RC"
+
+      - name: iPhone - persistence, rotation, update-install checks
+        if: always()
+        run: |
+          BUNDLE=com.geoappsdominicana.coritoedomino
+          echo "=== prefs before reinstall ==="
+          CONT=$(xcrun simctl get_app_container "$IPHONE_UDID" "$BUNDLE" data)
+          echo "container: $CONT"
+          plutil -p "$CONT/Library/Preferences/$BUNDLE.plist" > /tmp/prefs_iphone_before.txt 2>/dev/null || echo "NO_PLIST_BEFORE"
+          if grep -q '30,0' /tmp/prefs_iphone_before.txt; then echo "PERSIST_IPHONE=PASS(active 30,0)"; else echo "PERSIST_IPHONE=CHECK"; fi
+          echo "=== update-install real app (preserves container) ==="
+          xcrun simctl install "$IPHONE_UDID" /tmp/RunnerReal.app
+          echo "INSTALLED_REAL_APP"
+          plutil -p "$CONT/Library/Preferences/$BUNDLE.plist" > /tmp/prefs_iphone_after.txt 2>/dev/null || echo "NO_PLIST_AFTER"
+          if grep -q '30,0' /tmp/prefs_iphone_after.txt; then echo "UPDATE_KEEP_IPHONE=PASS(active preserved)"; else echo "UPDATE_KEEP_IPHONE=FAIL"; fi
+          xcrun simctl launch "$IPHONE_UDID" "$BUNDLE" || echo "LAUNCH_FAIL"
+          sleep 8
+          echo "=== rotation checks (must not crash) ==="
+          xcrun simctl ui "$IPHONE_UDID" orientation portrait
+          sleep 1
+          xcrun simctl io "$IPHONE_UDID" screenshot /tmp/qa_rotate_iphone_portrait.png
+          xcrun simctl ui "$IPHONE_UDID" orientation landscape-left
+          sleep 2
+          xcrun simctl io "$IPHONE_UDID" screenshot /tmp/qa_rotate_iphone_landscape.png
+          xcrun simctl ui "$IPHONE_UDID" orientation portrait
+          sleep 1
+          if ps aux | grep -F "/Runner.app/" | grep -v grep >/dev/null; then
+            echo "ROTATION_IPHONE=PASS(alive)"
+          else
+            echo "ROTATION_IPHONE=FAIL(no Runner process)"
+          fi
+
+      # ========================= iPad =========================
+      - name: QA drive - iPad
+        id: qa-ipad
+        timeout-minutes: 25
+        run: |
+          cd "$RUNNER_TEMP/corito-private"
+          set +e
+          flutter drive --driver=test_driver/integration_test.dart --target=integration_test/qa_test.dart --dart-define=QA_DEVICE=ipad -d "$IPAD_UDID" 2>&1 | tee /tmp/drive_ipad.log
+          RC=${PIPESTATUS[0]}
+          grep -E '^QA_|^SEVERE|^Error' /tmp/drive_ipad.log | head -80 || true
+          if [ "$RC" -ne 0 ]; then
+            echo "DRIVE_RC_IPAD=$RC"
+            echo "--- booted devices ---"
+            xcrun simctl list devices booted || true
+            echo "--- runner processes ---"
+            ps aux | grep -F "Runner.app" | grep -v grep || echo "NO_RUNNER_PROC"
+            echo "--- last 30 lines of drive log ---"
+            tail -30 /tmp/drive_ipad.log || true
+            echo "--- simulator log tail for bundle ---"
+            xcrun simctl spawn "$IPAD_UDID" log show --last 5m --style compact --predicate "processImagePath CONTAINS 'Runner'" 2>/dev/null | tail -40 || true
+          fi
+          exit "$RC"
+
+      - name: iPad - persistence, rotation, update-install checks
+        if: always()
+        run: |
+          BUNDLE=com.geoappsdominicana.coritoedomino
+          echo "=== prefs before reinstall ==="
+          CONT=$(xcrun simctl get_app_container "$IPAD_UDID" "$BUNDLE" data)
+          echo "container: $CONT"
+          plutil -p "$CONT/Library/Preferences/$BUNDLE.plist" > /tmp/prefs_ipad_before.txt 2>/dev/null || echo "NO_PLIST_BEFORE"
+          if grep -q '30,0' /tmp/prefs_ipad_before.txt; then echo "PERSIST_IPAD=PASS(active 30,0)"; else echo "PERSIST_IPAD=CHECK"; fi
+          echo "=== update-install real app (preserves container) ==="
+          xcrun simctl install "$IPAD_UDID" /tmp/RunnerReal.app
+          echo "INSTALLED_REAL_APP"
+          plutil -p "$CONT/Library/Preferences/$BUNDLE.plist" > /tmp/prefs_ipad_after.txt 2>/dev/null || echo "NO_PLIST_AFTER"
+          if grep -q '30,0' /tmp/prefs_ipad_after.txt; then echo "UPDATE_KEEP_IPAD=PASS(active preserved)"; else echo "UPDATE_KEEP_IPAD=FAIL"; fi
+          xcrun simctl launch "$IPAD_UDID" "$BUNDLE" || echo "LAUNCH_FAIL"
+          sleep 8
+          echo "=== rotation checks ==="
+          xcrun simctl ui "$IPAD_UDID" orientation portrait
+          sleep 1
+          xcrun simctl io "$IPAD_UDID" screenshot /tmp/qa_rotate_ipad_portrait.png
+          xcrun simctl ui "$IPAD_UDID" orientation landscape-left
+          sleep 2
+          xcrun simctl io "$IPAD_UDID" screenshot /tmp/qa_rotate_ipad_landscape.png
+          xcrun simctl ui "$IPAD_UDID" orientation portrait
+          sleep 1
+          if ps aux | grep -F "/Runner.app/" | grep -v grep >/dev/null; then
+            echo "ROTATION_IPAD=PASS(alive)"
+          else
+            echo "ROTATION_IPAD=FAIL(no Runner process)"
+          fi
+
+      - name: Crash-log sweep
+        if: always()
+        run: |
+          BUNDLE=com.geoappsdominicana.coritoedomino
+          for udid in "$IPHONE_UDID" "$IPAD_UDID"; do
+            if [ -n "$udid" ]; then
+              xcrun simctl spawn "$udid" log show --last 30m --style compact --predicate "process == '$BUNDLE'" 2>/dev/null > "/tmp/log_${udid}.txt" || true
+            fi
+          done
+          echo "=== crash markers in app logs ==="
+          cat /tmp/log_*.txt 2>/dev/null | grep -iE "exception|fatal|sigabrt|sigsegv|dyld|uncaught" | grep -v "0 (null)" | head -40 || echo "NO_CRASH_MARKERS"
+          echo "=== QA drive console markers ==="
+          grep -E '^QA_PHASE\||^QA_TOTAL|^QA_STOREKIT|^QA_URLS' /tmp/drive_iphone.log /tmp/drive_ipad.log || echo "NO_QA_LOG_RECORDED"
+
+      - name: Check QA results
+        if: always()
+        run: |
+          IP_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log || true)
+          PAD_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log || true)
+          echo "IPHONE_PHASE_FAILS=$IP_FAILS"
+          echo "IPAD_PHASE_FAILS=$PAD_FAILS"
+          echo "IPHONE_TOTAL=$(grep '^QA_TOTAL' /tmp/drive_iphone.log || echo none)"
+          echo "IPAD_TOTAL=$(grep '^QA_TOTAL' /tmp/drive_ipad.log || echo none)"
+          if [ -n "$IP_FAILS" ] && [ "$IP_FAILS" != "0" ]; then echo "QA_FAILED_IPHONE"; exit 1; fi
+          if [ -n "$PAD_FAILS" ] && [ "$PAD_FAILS" != "0" ]; then echo "QA_FAILED_IPAD"; exit 1; fi
+          echo "QA_ALL_PHASES_OK"
+
+      # Only explicitly safe files are staged for upload. No source, no .git,
+      # no DerivedData, no secrets, no keychains.
+      - name: Prepare safe artifact set
+        if: always()
+        run: |
+          SAFE="$RUNNER_TEMP/qa-safe-artifacts"
+          rm -rf "$SAFE"
+          mkdir -p "$SAFE/screenshots" "$SAFE/logs"
+          cp -f "$RUNNER_TEMP/corito-private"/build/screenshots/*.png "$SAFE/screenshots/" 2>/dev/null || echo "NO_SCREENSHOTS"
+          cp -f /tmp/drive_iphone.log /tmp/drive_ipad.log "$SAFE/logs/" 2>/dev/null || true
+          cp -f /tmp/prefs_iphone_before.txt /tmp/prefs_iphone_after.txt /tmp/prefs_ipad_before.txt /tmp/prefs_ipad_after.txt "$SAFE/logs/" 2>/dev/null || true
+          {
+            echo "IPHONE_PHASE_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || echo 0)"
+            echo "IPAD_PHASE_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || echo 0)"
+            grep -hE '^QA_PHASE\||^QA_TOTAL|^QA_STOREKIT|^QA_URLS' /tmp/drive_iphone.log /tmp/drive_ipad.log 2>/dev/null | sort -u
+            grep -hE 'PERSIST_IPHONE|UPDATE_KEEP_IPHONE|ROTATION_IPHONE|PERSIST_IPAD|UPDATE_KEEP_IPAD|ROTATION_IPAD' /tmp/qa_*.txt 2>/dev/null || true
+          } > "$SAFE/QA_RESULT.txt"
+          echo "SAFE_ARTIFACTS_READY"
+          ls -la "$SAFE"
+
+      - name: Upload QA artifacts (retention 1 day)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-build37-artifacts
+          path: $RUNNER_TEMP/qa-safe-artifacts
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Cleanup private checkout
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/corito-private"
+          rm -f "$HOME/.ssh/corito_qa_ed25519" "$HOME/.ssh/corito_qa_ed25519.pub"
+          ssh-agent -k >/dev/null 2>&1 || true
+          echo "PRIVATE_CHECKOUT_CLEANED"
