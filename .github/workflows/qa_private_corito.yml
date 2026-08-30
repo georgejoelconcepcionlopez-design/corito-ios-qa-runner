@@ -24,6 +24,8 @@ jobs:
 
       # Read-only SSH deploy key committed nowhere: key material comes from a
       # GitHub Actions secret only. Keyfile is deleted immediately after clone.
+      # Identity is provided via -i (file) + IdentitiesOnly=yes; no ssh-agent is
+      # used, because IdentitiesOnly=yes disregards agent-provided identities.
       - name: Clone private repo at fixed commit (read-only deploy key)
         env:
           CORITO_PRIVATE_REPO_SSH_KEY: ${{ secrets.CORITO_PRIVATE_REPO_SSH_KEY }}
@@ -33,16 +35,23 @@ jobs:
           mkdir -p "$HOME/.ssh"
           printf '%s\n' "$CORITO_PRIVATE_REPO_SSH_KEY" > "$HOME/.ssh/corito_qa_ed25519"
           chmod 600 "$HOME/.ssh/corito_qa_ed25519"
-          eval "$(ssh-agent -s)" >/dev/null
-          ssh-add "$HOME/.ssh/corito_qa_ed25519" >/dev/null
           ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null || true
+          # Preflight: prove the deploy key authenticates to GitHub before cloning.
+          AUTH=$(ssh -i "$HOME/.ssh/corito_qa_ed25519" -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -T git@github.com 2>&1 || true)
+          echo "$AUTH"
+          case "$AUTH" in
+            *"successfully authenticated"*) echo "DEPLOY_KEY_AUTH=OK" ;;
+            *) echo "DEPLOY_KEY_AUTH=FAIL"; exit 1 ;;
+          esac
           rm -rf "$RUNNER_TEMP/corito-private"
           GIT_TERMINAL_PROMPT=0 \
-          GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=15" \
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/corito_qa_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=15" \
             git init -q "$RUNNER_TEMP/corito-private"
           git -C "$RUNNER_TEMP/corito-private" remote add origin git@github.com:georgejoelconcepcionlopez-design/corito-domino-flutter.git
           GIT_TERMINAL_PROMPT=0 \
-          GIT_SSH_COMMAND="ssh -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=15" \
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/corito_qa_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=15" \
             git -C "$RUNNER_TEMP/corito-private" fetch --depth 1 origin "$PRIVATE_SHA"
           git -C "$RUNNER_TEMP/corito-private" checkout -q --detach FETCH_HEAD
           OUR_SHA=$(git -C "$RUNNER_TEMP/corito-private" rev-parse HEAD)
@@ -50,9 +59,8 @@ jobs:
           git -C "$RUNNER_TEMP/corito-private" log -1 --oneline
           if [ "$OUR_SHA" != "$PRIVATE_SHA" ]; then echo "PRIVATE_SHA_MISMATCH"; exit 1; fi
           echo "PRIVATE_CLONE_OK"
-          # Wipe the keyfile and kill the agent as soon as the clone is done.
+          # Wipe the keyfile as soon as the clone is done.
           rm -f "$HOME/.ssh/corito_qa_ed25519" "$HOME/.ssh/corito_qa_ed25519.pub"
-          ssh-agent -k >/dev/null 2>&1 || true
 
       - name: Flutter pub get (private checkout)
         run: |
@@ -282,5 +290,4 @@ jobs:
         run: |
           rm -rf "$RUNNER_TEMP/corito-private"
           rm -f "$HOME/.ssh/corito_qa_ed25519" "$HOME/.ssh/corito_qa_ed25519.pub"
-          ssh-agent -k >/dev/null 2>&1 || true
           echo "PRIVATE_CHECKOUT_CLEANED"
