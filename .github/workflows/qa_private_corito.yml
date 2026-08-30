@@ -29,7 +29,7 @@ jobs:
       - name: Clone private repo at fixed commit (read-only deploy key)
         env:
           CORITO_PRIVATE_REPO_SSH_KEY: ${{ secrets.CORITO_PRIVATE_REPO_SSH_KEY }}
-          PRIVATE_SHA: 1ce8891daca55dbd2976186aa14ea474b746191a
+          PRIVATE_SHA: 33d6e181efc7b5ff4a840fc87ce62f99af193f9f
         run: |
           echo "Setting up ephemeral SSH deploy key..."
           mkdir -p "$HOME/.ssh"
@@ -113,6 +113,7 @@ jobs:
           cd "$RUNNER_TEMP/corito-private"
           flutter build ios --simulator
           cp -R build/ios/iphonesimulator/Runner.app /tmp/RunnerReal.app
+          touch "$RUNNER_TEMP/.app_built"
           echo "REAL_APP_BUILT"
 
       - name: Offline surface audit (app has no remote dependencies)
@@ -130,23 +131,45 @@ jobs:
           set +e
           flutter drive --driver=test_driver/integration_test.dart --target=integration_test/qa_test.dart --dart-define=QA_DEVICE=iphone -d "$IPHONE_UDID" 2>&1 | tee /tmp/drive_iphone.log
           RC=${PIPESTATUS[0]}
+          set -e
+          echo "DRIVE_EXIT_IPHONE=$RC"
+          printf '%s\n' "$RC" > "$RUNNER_TEMP/drive_exit_iphone.txt"
           grep -E '^QA_|^SEVERE|^Error' /tmp/drive_iphone.log | head -80 || true
           if [ "$RC" -ne 0 ]; then
-            echo "DRIVE_RC_IPHONE=$RC"
+            echo "--- POST-FAIL DIAGNOSTICS (iPhone) ---"
+            echo "--- last 120 lines of drive log ---"
+            tail -120 /tmp/drive_iphone.log || true
+            echo "--- relevant drive log lines ---"
+            grep -E 'QA_PHASE|EXCEPTION|Exception|Expected|Actual|FlutterError|PlatformDispatcher|stack|FAILED|QA_TOTAL|Multiple exceptions' /tmp/drive_iphone.log | tail -120 || true
             echo "--- booted devices ---"
             xcrun simctl list devices booted || true
             echo "--- runner processes ---"
             ps aux | grep -F "Runner.app" | grep -v grep || echo "NO_RUNNER_PROC"
-            echo "--- last 30 lines of drive log ---"
-            tail -30 /tmp/drive_iphone.log || true
-            echo "--- simulator log tail for bundle ---"
-            xcrun simctl spawn "$IPHONE_UDID" log show --last 5m --style compact --predicate "processImagePath CONTAINS 'Runner'" 2>/dev/null | tail -40 || true
+            echo "--- simulator log (bundle + runner, filtered) ---"
+            xcrun simctl spawn "$IPHONE_UDID" log show --last 6m --style compact --predicate 'processImagePath CONTAINS "Runner"' 2>/dev/null | grep -iE 'flutter|exception|error|fatal' | tail -80 || true
+            echo "--- simulator log (bundle id direct) ---"
+            xcrun simctl spawn "$IPHONE_UDID" log show --last 6m --style compact --predicate 'process == "com.geoappsdominicana.coritoedomino"' 2>/dev/null | grep -iE 'flutter|exception|error|fatal' | tail -60 || true
+          fi
+          # Recover the harness phase/exception log written by qa_test.dart.
+          APP_DATA=$(xcrun simctl get_app_container "$IPHONE_UDID" com.geoappsdominicana.coritoedomino data 2>/dev/null || true)
+          if [ -n "$APP_DATA" ]; then
+            find "$APP_DATA" -maxdepth 6 -name 'qa_app.log' -exec cp -f {} /tmp/qa_app_iphone.log \; 2>/dev/null || true
+          fi
+          if [ -f /tmp/qa_app_iphone.log ]; then
+            echo "=== HARNESS qa_app_iphone.log ==="
+            cat /tmp/qa_app_iphone.log
+          else
+            echo "NO_HARNESS_LOG_IPHONE"
           fi
           exit "$RC"
 
       - name: iPhone - persistence, rotation, update-install checks
         if: always()
         run: |
+          if [ ! -f /tmp/drive_iphone.log ] || [ ! -f "$RUNNER_TEMP/.app_built" ]; then
+            echo "PERSIST_IPHONE=SKIP(drive/build prerequisite absent)"
+            exit 0
+          fi
           BUNDLE=com.geoappsdominicana.coritoedomino
           echo "=== prefs before reinstall ==="
           CONT=$(xcrun simctl get_app_container "$IPHONE_UDID" "$BUNDLE" data)
@@ -178,29 +201,59 @@ jobs:
       # ========================= iPad =========================
       - name: QA drive - iPad
         id: qa-ipad
+        if: always()
         timeout-minutes: 25
         run: |
+          # iPad must run/diagnose even if iPhone failed, but never on a broken
+          # base environment (clone/build/boot failed).
+          if [ ! -f "$RUNNER_TEMP/.app_built" ] || [ -z "$IPAD_UDID" ]; then
+            echo "IPAD_DRIVE_SKIPPED(env prerequisite absent)"
+            printf '%s\n' "skip" > "$RUNNER_TEMP/drive_exit_ipad.txt"
+            exit 0
+          fi
           cd "$RUNNER_TEMP/corito-private"
           set +e
           flutter drive --driver=test_driver/integration_test.dart --target=integration_test/qa_test.dart --dart-define=QA_DEVICE=ipad -d "$IPAD_UDID" 2>&1 | tee /tmp/drive_ipad.log
           RC=${PIPESTATUS[0]}
+          set -e
+          echo "DRIVE_EXIT_IPAD=$RC"
+          printf '%s\n' "$RC" > "$RUNNER_TEMP/drive_exit_ipad.txt"
           grep -E '^QA_|^SEVERE|^Error' /tmp/drive_ipad.log | head -80 || true
           if [ "$RC" -ne 0 ]; then
-            echo "DRIVE_RC_IPAD=$RC"
+            echo "--- POST-FAIL DIAGNOSTICS (iPad) ---"
+            echo "--- last 120 lines of drive log ---"
+            tail -120 /tmp/drive_ipad.log || true
+            echo "--- relevant drive log lines ---"
+            grep -E 'QA_PHASE|EXCEPTION|Exception|Expected|Actual|FlutterError|PlatformDispatcher|stack|FAILED|QA_TOTAL|Multiple exceptions' /tmp/drive_ipad.log | tail -120 || true
             echo "--- booted devices ---"
             xcrun simctl list devices booted || true
             echo "--- runner processes ---"
             ps aux | grep -F "Runner.app" | grep -v grep || echo "NO_RUNNER_PROC"
-            echo "--- last 30 lines of drive log ---"
-            tail -30 /tmp/drive_ipad.log || true
-            echo "--- simulator log tail for bundle ---"
-            xcrun simctl spawn "$IPAD_UDID" log show --last 5m --style compact --predicate "processImagePath CONTAINS 'Runner'" 2>/dev/null | tail -40 || true
+            echo "--- simulator log (bundle + runner, filtered) ---"
+            xcrun simctl spawn "$IPAD_UDID" log show --last 6m --style compact --predicate 'processImagePath CONTAINS "Runner"' 2>/dev/null | grep -iE 'flutter|exception|error|fatal' | tail -80 || true
+            echo "--- simulator log (bundle id direct) ---"
+            xcrun simctl spawn "$IPAD_UDID" log show --last 6m --style compact --predicate 'process == "com.geoappsdominicana.coritoedomino"' 2>/dev/null | grep -iE 'flutter|exception|error|fatal' | tail -60 || true
+          fi
+          # Recover the harness phase/exception log written by qa_test.dart.
+          APP_DATA=$(xcrun simctl get_app_container "$IPAD_UDID" com.geoappsdominicana.coritoedomino data 2>/dev/null || true)
+          if [ -n "$APP_DATA" ]; then
+            find "$APP_DATA" -maxdepth 6 -name 'qa_app.log' -exec cp -f {} /tmp/qa_app_ipad.log \; 2>/dev/null || true
+          fi
+          if [ -f /tmp/qa_app_ipad.log ]; then
+            echo "=== HARNESS qa_app_ipad.log ==="
+            cat /tmp/qa_app_ipad.log
+          else
+            echo "NO_HARNESS_LOG_IPAD"
           fi
           exit "$RC"
 
       - name: iPad - persistence, rotation, update-install checks
         if: always()
         run: |
+          if [ ! -f /tmp/drive_ipad.log ] || [ ! -f "$RUNNER_TEMP/.app_built" ]; then
+            echo "PERSIST_IPAD=SKIP(drive/build prerequisite absent)"
+            exit 0
+          fi
           BUNDLE=com.geoappsdominicana.coritoedomino
           echo "=== prefs before reinstall ==="
           CONT=$(xcrun simctl get_app_container "$IPAD_UDID" "$BUNDLE" data)
@@ -246,15 +299,30 @@ jobs:
       - name: Check QA results
         if: always()
         run: |
-          IP_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log || true)
-          PAD_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log || true)
+          echo "=== drive exit codes ==="
+          echo "DRIVE_EXIT_IPHONE=$(cat "$RUNNER_TEMP/drive_exit_iphone.txt" 2>/dev/null || echo unset)"
+          echo "DRIVE_EXIT_IPAD=$(cat "$RUNNER_TEMP/drive_exit_ipad.txt" 2>/dev/null || echo unset)"
+          echo "=== harness phase/exception logs ==="
+          grep -hE 'QA_PHASE\||QA_EXCEPTION|QA_SUMMARY|^total_phases=|^passed=|^failed=|^unexpected_exceptions=|^result=' /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u || echo "NO_HARNESS_LOGS"
+          echo "=== drive log marker counts ==="
+          IP_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || true)
+          PAD_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || true)
           echo "IPHONE_PHASE_FAILS=$IP_FAILS"
           echo "IPAD_PHASE_FAILS=$PAD_FAILS"
-          echo "IPHONE_TOTAL=$(grep '^QA_TOTAL' /tmp/drive_iphone.log || echo none)"
-          echo "IPAD_TOTAL=$(grep '^QA_TOTAL' /tmp/drive_ipad.log || echo none)"
-          if [ -n "$IP_FAILS" ] && [ "$IP_FAILS" != "0" ]; then echo "QA_FAILED_IPHONE"; exit 1; fi
-          if [ -n "$PAD_FAILS" ] && [ "$PAD_FAILS" != "0" ]; then echo "QA_FAILED_IPAD"; exit 1; fi
-          echo "QA_ALL_PHASES_OK"
+          IPE=$(cat "$RUNNER_TEMP/drive_exit_iphone.txt" 2>/dev/null || echo unset)
+          IPD=$(cat "$RUNNER_TEMP/drive_exit_ipad.txt" 2>/dev/null || echo unset)
+          FAIL=0
+          if [ "$IPE" = "unset" ]; then echo "IPHONE_DRIVE_NEVER_RAN"; FAIL=1; fi
+          if [ "$IPD" = "unset" ]; then echo "IPAD_DRIVE_NEVER_RAN"; FAIL=1; fi
+          if [ -n "$IPE" ] && [ "$IPE" != "0" ]; then echo "QA_FAILED_IPHONE(drive exit $IPE)"; FAIL=1; fi
+          if [ -n "$IPD" ] && [ "$IPD" != "skip" ] && [ "$IPD" != "0" ]; then echo "QA_FAILED_IPAD(drive exit $IPD)"; FAIL=1; fi
+          if [ -n "$IP_FAILS" ] && [ "$IP_FAILS" != "0" ]; then echo "QA_FAILED_IPHONE_PHASES"; FAIL=1; fi
+          if [ -n "$PAD_FAILS" ] && [ "$PAD_FAILS" != "0" ]; then echo "QA_FAILED_IPAD_PHASES"; FAIL=1; fi
+          # Harness-file unexpected exceptions also fail the gate.
+          UNEXPECTED=$(grep -ch '^QA_EXCEPTION' /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | awk '{s+=$1} END{print s+0}' || true)
+          echo "UNEXPECTED_EXCEPTIONS=$UNEXPECTED"
+          if [ -n "$UNEXPECTED" ] && [ "$UNEXPECTED" != "0" ]; then echo "QA_UNEXPECTED_EXCEPTIONS_DETECTED"; FAIL=1; fi
+          if [ "$FAIL" -eq 0 ]; then echo "QA_ALL_PHASES_OK"; else exit 1; fi
 
       # Only explicitly safe files are staged for upload. No source, no .git,
       # no DerivedData, no secrets, no keychains.
@@ -265,25 +333,31 @@ jobs:
           rm -rf "$SAFE"
           mkdir -p "$SAFE/screenshots" "$SAFE/logs"
           cp -f "$RUNNER_TEMP/corito-private"/build/screenshots/*.png "$SAFE/screenshots/" 2>/dev/null || echo "NO_SCREENSHOTS"
+          cp -f /tmp/qa_rotate_*.png "$SAFE/screenshots/" 2>/dev/null || true
           cp -f /tmp/drive_iphone.log /tmp/drive_ipad.log "$SAFE/logs/" 2>/dev/null || true
+          cp -f /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log "$SAFE/logs/" 2>/dev/null || true
           cp -f /tmp/prefs_iphone_before.txt /tmp/prefs_iphone_after.txt /tmp/prefs_ipad_before.txt /tmp/prefs_ipad_after.txt "$SAFE/logs/" 2>/dev/null || true
+          cp -f /tmp/log_*.txt "$SAFE/logs/" 2>/dev/null || true
           {
+            echo "DRIVE_EXIT_IPHONE=$(cat "$RUNNER_TEMP/drive_exit_iphone.txt" 2>/dev/null || echo unset)"
+            echo "DRIVE_EXIT_IPAD=$(cat "$RUNNER_TEMP/drive_exit_ipad.txt" 2>/dev/null || echo unset)"
             echo "IPHONE_PHASE_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || echo 0)"
             echo "IPAD_PHASE_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || echo 0)"
-            grep -hE '^QA_PHASE\||^QA_TOTAL|^QA_STOREKIT|^QA_URLS' /tmp/drive_iphone.log /tmp/drive_ipad.log 2>/dev/null | sort -u
+            grep -hE '^QA_PHASE\||^QA_TOTAL|^QA_STOREKIT|^QA_URLS|^QA_EXCEPTION|^QA_SUMMARY|^total_phases=|^passed=|^failed=|^unexpected_exceptions=|^result=' /tmp/drive_iphone.log /tmp/drive_ipad.log /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u
             grep -hE 'PERSIST_IPHONE|UPDATE_KEEP_IPHONE|ROTATION_IPHONE|PERSIST_IPAD|UPDATE_KEEP_IPAD|ROTATION_IPAD' /tmp/qa_*.txt 2>/dev/null || true
           } > "$SAFE/QA_RESULT.txt"
           echo "SAFE_ARTIFACTS_READY"
           ls -la "$SAFE"
+          find "$SAFE" -type f | sed "s|$RUNNER_TEMP/||" | sort
 
       - name: Upload QA artifacts (retention 1 day)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: qa-build37-artifacts
-          path: $RUNNER_TEMP/qa-safe-artifacts
+          path: ${{ runner.temp }}/qa-safe-artifacts
           retention-days: 1
-          if-no-files-found: warn
+          if-no-files-found: error
 
       - name: Cleanup private checkout
         if: always()
