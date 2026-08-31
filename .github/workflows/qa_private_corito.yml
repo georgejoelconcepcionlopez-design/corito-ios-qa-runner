@@ -29,7 +29,7 @@ jobs:
       - name: Clone private repo at fixed commit (read-only deploy key)
         env:
           CORITO_PRIVATE_REPO_SSH_KEY: ${{ secrets.CORITO_PRIVATE_REPO_SSH_KEY }}
-          PRIVATE_SHA: 33d6e181efc7b5ff4a840fc87ce62f99af193f9f
+          PRIVATE_SHA: f247b3a7ca6b26481b4bb7382cc3a1288723472f
         run: |
           echo "Setting up ephemeral SSH deploy key..."
           mkdir -p "$HOME/.ssh"
@@ -151,15 +151,29 @@ jobs:
             xcrun simctl spawn "$IPHONE_UDID" log show --last 6m --style compact --predicate 'process == "com.geoappsdominicana.coritoedomino"' 2>/dev/null | grep -iE 'flutter|exception|error|fatal' | tail -60 || true
           fi
           # Recover the harness phase/exception log written by qa_test.dart.
+          # v2: on iOS the harness now writes to $HOME/Documents/qa_app.log
+          # (sandbox root = the DATA container returned below); -L follows
+          # symlinks so systemTemp variants are caught too.
           APP_DATA=$(xcrun simctl get_app_container "$IPHONE_UDID" com.geoappsdominicana.coritoedomino data 2>/dev/null || true)
+          echo "APP_DATA_IPHONE=$APP_DATA"
           if [ -n "$APP_DATA" ]; then
-            find "$APP_DATA" -maxdepth 6 -name 'qa_app.log' -exec cp -f {} /tmp/qa_app_iphone.log \; 2>/dev/null || true
+            find -L "$APP_DATA" -maxdepth 10 -name 'qa_app.log' -exec cp -f {} /tmp/qa_app_iphone.log \; 2>/dev/null || true
           fi
           if [ -f /tmp/qa_app_iphone.log ]; then
             echo "=== HARNESS qa_app_iphone.log ==="
             cat /tmp/qa_app_iphone.log
           else
-            echo "NO_HARNESS_LOG_IPHONE"
+            # Fallback: HOME may not equal the data container on some runtimes.
+            for c in "$APP_DATA" "$(xcrun simctl get_app_container "$IPHONE_UDID" com.geoappsdominicana.coritoedomino app 2>/dev/null || true)"; do
+              [ -n "$c" ] && find -L "$c" -maxdepth 14 -iname 'qa_app.log' -exec cp -f {} /tmp/qa_app_iphone.log \; 2>/dev/null || true
+              [ -f /tmp/qa_app_iphone.log ] && break
+            done
+            if [ -f /tmp/qa_app_iphone.log ]; then
+              echo "=== HARNESS qa_app_iphone.log ==="
+              cat /tmp/qa_app_iphone.log
+            else
+              echo "NO_HARNESS_LOG_IPHONE"
+            fi
           fi
           exit "$RC"
 
@@ -235,15 +249,29 @@ jobs:
             xcrun simctl spawn "$IPAD_UDID" log show --last 6m --style compact --predicate 'process == "com.geoappsdominicana.coritoedomino"' 2>/dev/null | grep -iE 'flutter|exception|error|fatal' | tail -60 || true
           fi
           # Recover the harness phase/exception log written by qa_test.dart.
+          # v2: on iOS the harness now writes to $HOME/Documents/qa_app.log
+          # (sandbox root = the DATA container returned below); -L follows
+          # symlinks so systemTemp variants are caught too.
           APP_DATA=$(xcrun simctl get_app_container "$IPAD_UDID" com.geoappsdominicana.coritoedomino data 2>/dev/null || true)
+          echo "APP_DATA_IPAD=$APP_DATA"
           if [ -n "$APP_DATA" ]; then
-            find "$APP_DATA" -maxdepth 6 -name 'qa_app.log' -exec cp -f {} /tmp/qa_app_ipad.log \; 2>/dev/null || true
+            find -L "$APP_DATA" -maxdepth 10 -name 'qa_app.log' -exec cp -f {} /tmp/qa_app_ipad.log \; 2>/dev/null || true
           fi
           if [ -f /tmp/qa_app_ipad.log ]; then
             echo "=== HARNESS qa_app_ipad.log ==="
             cat /tmp/qa_app_ipad.log
           else
-            echo "NO_HARNESS_LOG_IPAD"
+            # Fallback: HOME may not equal the data container on some runtimes.
+            for c in "$APP_DATA" "$(xcrun simctl get_app_container "$IPAD_UDID" com.geoappsdominicana.coritoedomino app 2>/dev/null || true)"; do
+              [ -n "$c" ] && find -L "$c" -maxdepth 14 -iname 'qa_app.log' -exec cp -f {} /tmp/qa_app_ipad.log \; 2>/dev/null || true
+              [ -f /tmp/qa_app_ipad.log ] && break
+            done
+            if [ -f /tmp/qa_app_ipad.log ]; then
+              echo "=== HARNESS qa_app_ipad.log ==="
+              cat /tmp/qa_app_ipad.log
+            else
+              echo "NO_HARNESS_LOG_IPAD"
+            fi
           fi
           exit "$RC"
 
@@ -294,7 +322,7 @@ jobs:
           echo "=== crash markers in app logs ==="
           cat /tmp/log_*.txt 2>/dev/null | grep -iE "exception|fatal|sigabrt|sigsegv|dyld|uncaught" | grep -v "0 (null)" | head -40 || echo "NO_CRASH_MARKERS"
           echo "=== QA drive console markers ==="
-          grep -E '^QA_PHASE\||^QA_TOTAL|^QA_STOREKIT|^QA_URLS' /tmp/drive_iphone.log /tmp/drive_ipad.log || echo "NO_QA_LOG_RECORDED"
+          grep -E 'QA_PHASE\|FAIL|^QA_TOTAL|^QA_STOREKIT|^QA_URLS|QA_EXCEPTION|QA_D_AFTER_SAVE|QA_UI_AT_FAIL' /tmp/drive_iphone.log /tmp/drive_ipad.log || echo "NO_QA_LOG_RECORDED"
 
       - name: Check QA results
         if: always()
@@ -305,8 +333,8 @@ jobs:
           echo "=== harness phase/exception logs ==="
           grep -hE 'QA_PHASE\||QA_EXCEPTION|QA_SUMMARY|^total_phases=|^passed=|^failed=|^unexpected_exceptions=|^result=' /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u || echo "NO_HARNESS_LOGS"
           echo "=== drive log marker counts ==="
-          IP_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || true)
-          PAD_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || true)
+          IP_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || true)
+          PAD_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || true)
           echo "IPHONE_PHASE_FAILS=$IP_FAILS"
           echo "IPAD_PHASE_FAILS=$PAD_FAILS"
           IPE=$(cat "$RUNNER_TEMP/drive_exit_iphone.txt" 2>/dev/null || echo unset)
@@ -341,9 +369,9 @@ jobs:
           {
             echo "DRIVE_EXIT_IPHONE=$(cat "$RUNNER_TEMP/drive_exit_iphone.txt" 2>/dev/null || echo unset)"
             echo "DRIVE_EXIT_IPAD=$(cat "$RUNNER_TEMP/drive_exit_ipad.txt" 2>/dev/null || echo unset)"
-            echo "IPHONE_PHASE_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || echo 0)"
-            echo "IPAD_PHASE_FAILS=$(grep -c '^QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || echo 0)"
-            grep -hE '^QA_PHASE\||^QA_TOTAL|^QA_STOREKIT|^QA_URLS|^QA_EXCEPTION|^QA_SUMMARY|^total_phases=|^passed=|^failed=|^unexpected_exceptions=|^result=' /tmp/drive_iphone.log /tmp/drive_ipad.log /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u
+            echo "IPHONE_PHASE_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || echo 0)"
+            echo "IPAD_PHASE_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || echo 0)"
+            grep -hE 'QA_PHASE\|PASS|QA_PHASE\|FAIL|QA_TOTAL|QA_STOREKIT|QA_URLS|QA_EXCEPTION|QA_SUMMARY|QA_D_AFTER_SAVE|QA_UI_AT_FAIL|QA_LOG_PATH_FINAL|total_phases=|passed=|failed=|unexpected_exceptions=|result=' /tmp/drive_iphone.log /tmp/drive_ipad.log /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u
             grep -hE 'PERSIST_IPHONE|UPDATE_KEEP_IPHONE|ROTATION_IPHONE|PERSIST_IPAD|UPDATE_KEEP_IPAD|ROTATION_IPAD' /tmp/qa_*.txt 2>/dev/null || true
           } > "$SAFE/QA_RESULT.txt"
           echo "SAFE_ARTIFACTS_READY"
