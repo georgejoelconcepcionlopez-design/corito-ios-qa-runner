@@ -29,7 +29,7 @@ jobs:
       - name: Clone private repo at fixed commit (read-only deploy key)
         env:
           CORITO_PRIVATE_REPO_SSH_KEY: ${{ secrets.CORITO_PRIVATE_REPO_SSH_KEY }}
-          PRIVATE_SHA: dd3928f6381d4b77a715ca014cb37c5cf100778d
+          PRIVATE_SHA: 0662c416f7dad89d7244d95aea3c543580b03f65
         run: |
           echo "Setting up ephemeral SSH deploy key..."
           mkdir -p "$HOME/.ssh"
