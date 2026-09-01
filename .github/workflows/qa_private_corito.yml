@@ -96,17 +96,26 @@ jobs:
           echo "IPAD_UDID=$IPAD" >> "$GITHUB_ENV"
           echo "UDIDS_OK"
 
-      - name: Boot simulators
+      - name: Boot iPhone simulator
         run: |
+          echo "=== STARTUP DIAGNOSTICS ==="
+          echo "flutter: $(flutter --version | head -1)"
+          echo "xcode: $(xcodebuild -version | head -1)"
+          echo "runtime: $(xcrun simctl list runtimes 2>/dev/null | grep -i available | head -3)"
+          echo "simctl: $(xcrun simctl --version 2>/dev/null || true)"
+          echo "=== devices available before boot ==="
+          xcrun simctl list devices available | head -40 || true
+          echo "=== booting only iPhone (one device at a time) ==="
           echo "Booting $IPHONE_UDID"
           xcrun simctl boot "$IPHONE_UDID" 2>/dev/null || true
           xcrun simctl bootstatus "$IPHONE_UDID" -b
           echo "iPhone booted"
-          echo "Booting $IPAD_UDID"
-          xcrun simctl boot "$IPAD_UDID" 2>/dev/null || true
-          xcrun simctl bootstatus "$IPAD_UDID" -b
-          echo "BOTH_BOOTED"
+          echo "=== booted devices ==="
           xcrun simctl list devices booted
+          echo "=== pre-drive cleanup on iPhone (stale state) ==="
+          xcrun simctl terminate "$IPHONE_UDID" com.geoappsdominicana.coritoedomino 2>/dev/null || true
+          xcrun simctl uninstall "$IPHONE_UDID" com.geoappsdominicana.coritoedomino 2>/dev/null || true
+          echo "IPHONE_CLEAN_FOR_DRIVE"
 
       - name: Build real app (simulator, debug) once
         run: |
@@ -242,6 +251,38 @@ jobs:
             echo "ROTATION_IPHONE=FAIL(no Runner process)"
           fi
 
+      # Serialize devices: free iPhone (capturing its sim log first) so only one
+      # simulator renders Metal frames at a time; then boot iPad fresh for its drive.
+      - name: Capture iPhone sim log + shutdown iPhone
+        if: always()
+        run: |
+          echo "capturing iPhone simulator log (still booted)"
+          xcrun simctl spawn "$IPHONE_UDID" log show --last 30m --style compact --predicate "process == 'com.geoappsdominicana.coritoedomino'" 2>/dev/null > "/tmp/log_${IPHONE_UDID}.txt" || true
+          echo "shutting down iPhone to free Metal/GPU"
+          xcrun simctl shutdown "$IPHONE_UDID" 2>/dev/null || true
+          echo "booted devices after iPhone shutdown:"
+          xcrun simctl list devices booted || true
+          echo "IPHONE_FREED"
+
+      - name: Boot iPad simulator (serialized)
+        if: always()
+        run: |
+          # Only proceed if the environment base is intact (clone/build/boot succeeded).
+          if [ ! -f "$RUNNER_TEMP/.app_built" ] || [ -z "$IPAD_UDID" ]; then
+            echo "IPAD_BOOT_SKIPPED(base env absent)"
+            exit 0
+          fi
+          echo "Booting $IPAD_UDID (now only device rendering)"
+          xcrun simctl boot "$IPAD_UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$IPAD_UDID" -b
+          echo "iPad booted"
+          echo "=== booted devices ==="
+          xcrun simctl list devices booted
+          echo "=== pre-drive cleanup on iPad (stale state) ==="
+          xcrun simctl terminate "$IPAD_UDID" com.geoappsdominicana.coritoedomino 2>/dev/null || true
+          xcrun simctl uninstall "$IPAD_UDID" com.geoappsdominicana.coritoedomino 2>/dev/null || true
+          echo "IPAD_CLEAN_FOR_DRIVE"
+
       # ========================= iPad =========================
       # Self-managed timeout (budget 15 min) so recovery always runs; step
       # timeout is only a safety net > budget. Penalized how long it can burn
@@ -373,7 +414,13 @@ jobs:
           BUNDLE=com.geoappsdominicana.coritoedomino
           for udid in "$IPHONE_UDID" "$IPAD_UDID"; do
             if [ -n "$udid" ]; then
-              xcrun simctl spawn "$udid" log show --last 30m --style compact --predicate "process == '$BUNDLE'" 2>/dev/null > "/tmp/log_${udid}.txt" || true
+              # Avoid overwriting an earlier-captured log (e.g. iPhone captured
+              # before shutdown): only capture when no non-empty log exists.
+              if [ -s "/tmp/log_${udid}.txt" ]; then
+                echo "log_${udid}.txt already captured, skipping"
+              else
+                xcrun simctl spawn "$udid" log show --last 30m --style compact --predicate "process == '$BUNDLE'" 2>/dev/null > "/tmp/log_${udid}.txt" || true
+              fi
             fi
           done
           echo "=== crash markers in app logs ==="
