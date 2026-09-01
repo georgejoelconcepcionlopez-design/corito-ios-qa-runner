@@ -29,7 +29,7 @@ jobs:
       - name: Clone private repo at fixed commit (read-only deploy key)
         env:
           CORITO_PRIVATE_REPO_SSH_KEY: ${{ secrets.CORITO_PRIVATE_REPO_SSH_KEY }}
-          PRIVATE_SHA: 0662c416f7dad89d7244d95aea3c543580b03f65
+          PRIVATE_SHA: 176a25c80d20501dfb7a7df401198903443d7329
         run: |
           echo "Setting up ephemeral SSH deploy key..."
           mkdir -p "$HOME/.ssh"
@@ -441,7 +441,7 @@ jobs:
           echo "---"
           cat "$RUNNER_TEMP/QA_PHASE_PROGRESS_IPAD.txt" 2>/dev/null || echo "NO_PHASE_PROGRESS_IPAD"
           echo "=== harness phase/exception logs ==="
-          grep -hE 'QA_PHASE\||QA_EXCEPTION|QA_SUMMARY|^total_phases=|^passed=|^failed=|^unexpected_exceptions=|^result=' /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u || echo "NO_HARNESS_LOGS"
+          grep -hE 'QA_PHASE\||QA_EXCEPTION|QA_SUMMARY|^total_phases=|^passed=|^failed=|^unexpected_exceptions=|^result=|QA_PHASE_STACK|QA_SETTINGS_ROW|QA_LANGUAGE|QA_PREMIUM|QA_STOREKIT|QA_URLS|QA_UI_AT_FAIL|QA_D_AFTER_SAVE' /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log /tmp/drive_iphone.log /tmp/drive_ipad.log 2>/dev/null | sort -u || echo "NO_HARNESS_LOGS"
           echo "=== drive log marker counts ==="
           IP_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || true)
           PAD_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || true)
@@ -483,7 +483,7 @@ jobs:
             echo "DRIVE_EXIT_IPAD=$(cat "$RUNNER_TEMP/drive_exit_ipad.txt" 2>/dev/null || echo unset)"
             echo "IPHONE_PHASE_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_iphone.log 2>/dev/null || echo 0)"
             echo "IPAD_PHASE_FAILS=$(grep -c 'QA_PHASE|FAIL' /tmp/drive_ipad.log 2>/dev/null || echo 0)"
-            grep -hE 'QA_PHASE\|PASS|QA_PHASE\|FAIL|QA_TOTAL|QA_STOREKIT|QA_URLS|QA_EXCEPTION|QA_SUMMARY|QA_D_AFTER_SAVE|QA_UI_AT_FAIL|QA_LOG_PATH_FINAL|total_phases=|passed=|failed=|unexpected_exceptions=|result=' /tmp/drive_iphone.log /tmp/drive_ipad.log /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u
+            grep -hE 'QA_PHASE\|PASS|QA_PHASE\|FAIL|QA_TOTAL|QA_STOREKIT|QA_URLS|QA_EXCEPTION|QA_SUMMARY|QA_D_AFTER_SAVE|QA_UI_AT_FAIL|QA_LOG_PATH_FINAL|QA_PHASE_STACK|QA_SETTINGS_ROW|QA_LANGUAGE|QA_PREMIUM|total_phases=|passed=|failed=|unexpected_exceptions=|result=' /tmp/drive_iphone.log /tmp/drive_ipad.log /tmp/qa_app_iphone.log /tmp/qa_app_ipad.log 2>/dev/null | sort -u
             grep -hE 'PERSIST_IPHONE|UPDATE_KEEP_IPHONE|ROTATION_IPHONE|PERSIST_IPAD|UPDATE_KEEP_IPAD|ROTATION_IPAD' /tmp/qa_*.txt 2>/dev/null || true
           } > "$SAFE/QA_RESULT.txt"
           echo "SAFE_ARTIFACTS_READY"
